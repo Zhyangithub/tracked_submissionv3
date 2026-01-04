@@ -1,26 +1,30 @@
+"""
+TrackRAD2025 Submission - Corrected Version
+Fixes:
+1. Normalization mismatch (Percentile vs Max)
+2. Geometry transposition (W,H,T vs T,H,W)
+3. Architecture loading
+"""
+
 import os
+from pathlib import Path
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from pathlib import Path
 from scipy.ndimage import zoom, label as scipy_label, sum as scipy_sum
 
 # =============================================================================
-# 配置与路径
+# 配置
 # =============================================================================
-
-# Grand Challenge 容器内的资源路径
 RESOURCE_PATH = Path("resources")
 WEIGHTS_PATH = RESOURCE_PATH / "best_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 图像尺寸必须与训练时一致 (Config.image_size = 256)
 IMAGE_SIZE = 256
-BASE_CHANNELS = 64  # Config.base_channels = 64
+BASE_CHANNELS = 64  # 必须与训练时的配置一致
 
 # =============================================================================
-# 模型架构 (完全复制自 trackrad_unet_v2.py)
+# 1. 模型架构 (必须与训练代码完全一致)
 # =============================================================================
 
 class ChannelAttention(nn.Module):
@@ -34,7 +38,6 @@ class ChannelAttention(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(reduced, channels, 1, bias=False)
         )
-    
     def forward(self, x):
         avg_out = self.fc(self.avg_pool(x))
         max_out = self.fc(self.max_pool(x))
@@ -44,7 +47,6 @@ class SpatialAttention(nn.Module):
     def __init__(self, kernel_size: int = 7):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
-    
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
@@ -56,7 +58,6 @@ class CBAM(nn.Module):
         super().__init__()
         self.ca = ChannelAttention(channels)
         self.sa = SpatialAttention()
-    
     def forward(self, x):
         x = x * self.ca(x)
         x = x * self.sa(x)
@@ -157,7 +158,7 @@ class UNetV2(nn.Module):
         self.up3 = Up(base_ch * 4, base_ch * 2)
         self.up4 = Up(base_ch * 2, base_ch)
         
-        # 即使推理时不返回deep output，这些层在权重文件中依然存在，必须定义
+        # 定义辅助头以匹配权重文件 (即使推理不用)
         self.deep_out4 = nn.Conv2d(base_ch * 8, out_channels, 1)
         self.deep_out3 = nn.Conv2d(base_ch * 4, out_channels, 1)
         self.deep_out2 = nn.Conv2d(base_ch * 2, out_channels, 1)
@@ -179,26 +180,28 @@ class UNetV2(nn.Module):
         return out
 
 # =============================================================================
-# 推理逻辑
+# 2. 推理引擎 (包含关键的预处理修复)
 # =============================================================================
 
 class SequenceInference:
-    """提取自训练代码的推理类"""
     def __init__(self, model):
         self.model = model
         self.image_size = IMAGE_SIZE
     
     @torch.no_grad()
     def predict_sequence(self, frames: np.ndarray, first_mask: np.ndarray) -> np.ndarray:
-        # frames: (T, H, W)
+        # Input frames: (T, H, W)
         T, H, W = frames.shape
         target_size = self.image_size
         
-        # --- 1. 预处理 (复用训练代码逻辑) ---
+        # --- [CRITICAL FIX] 1. 预处理: 百分位归一化 ---
+        # 必须与 trackrad_unet_v2.py (lines 301-305) 完全一致
         frames_norm = frames.astype(np.float32)
         for t in range(T):
             frame = frames_norm[t]
             non_zero = frame[frame > 0]
+            
+            # 使用 percentile 避免极亮噪点导致的"黑图"
             if len(non_zero) > 100:
                 p_low, p_high = np.percentile(non_zero, [1, 99])
                 frame = np.clip(frame, p_low, p_high)
@@ -207,7 +210,7 @@ class SequenceInference:
                 frame = frame / (frame.max() + 1e-8)
             frames_norm[t] = frame
         
-        # 调整尺寸 (使用scipy.zoom以匹配训练)
+        # --- 2. Resize: 使用 scipy.zoom (order=1) ---
         scale_h, scale_w = target_size / H, target_size / W
         frames_resized = np.zeros((T, target_size, target_size), dtype=np.float32)
         
@@ -216,7 +219,7 @@ class SequenceInference:
         
         first_mask_resized = zoom(first_mask.astype(float), (scale_h, scale_w), order=0)
         
-        # --- 2. 逐帧预测 ---
+        # --- 3. 序列预测循环 ---
         predictions = np.zeros((T, target_size, target_size), dtype=np.float32)
         predictions[0] = first_mask_resized
         
@@ -224,7 +227,7 @@ class SequenceInference:
         prev_mask = first_mask_resized.copy()
         
         for t in range(1, T):
-            # 构造4通道输入
+            # 构造输入: [当前, 前一帧, 初始Mask, 前一Mask]
             input_tensor = np.stack([
                 frames_resized[t], 
                 prev_frame,
@@ -232,21 +235,20 @@ class SequenceInference:
                 prev_mask
             ], axis=0)
             
-            # 转Tensor
             input_tensor = torch.from_numpy(input_tensor[np.newaxis]).float().to(DEVICE)
             
             # 推理
             output = self.model(input_tensor, return_deep=False)
             pred = (torch.sigmoid(output) > 0.5).cpu().numpy()[0, 0]
             
-            # 后处理
+            # 后处理: 连通域 + 平滑
             pred = self._post_process(pred, prev_mask)
             
             predictions[t] = pred
             prev_frame = frames_resized[t].copy()
             prev_mask = pred.copy()
         
-        # --- 3. 恢复原始尺寸 ---
+        # --- 4. 恢复尺寸 ---
         predictions_orig = np.zeros((T, H, W), dtype=np.uint8)
         for t in range(T):
             resized_back = zoom(predictions[t], (H / target_size, W / target_size), order=0)
@@ -258,71 +260,61 @@ class SequenceInference:
         if pred.sum() == 0:
             return prev_mask.copy()
         
-        # 保留最大连通域
+        # 1. 保留最大连通域 (去除噪点)
         labeled, n = scipy_label(pred)
         if n > 0:
             sizes = scipy_sum(pred, labeled, range(1, n + 1))
             largest = np.argmax(sizes) + 1
             pred = (labeled == largest).astype(float)
         
-        # 时序平滑
+        # 2. 时序平滑 (减少抖动)
+        # 注意：如果发现拖影严重，可尝试调整系数为 0.9/0.1
         pred = 0.7 * pred + 0.3 * prev_mask
         pred = (pred > 0.5).astype(float)
         
         return pred
 
 # =============================================================================
-# 全局模型加载 (Lazy Loading)
+# 全局加载
 # =============================================================================
 
 _ENGINE = None
 
 def _load_engine():
-    # 实例化模型，必须与训练配置一致 (base_ch=64)
     model = UNetV2(in_channels=4, out_channels=1, base_ch=BASE_CHANNELS)
-    
     if not WEIGHTS_PATH.exists():
-        # 用于本地调试的错误提示
-        raise FileNotFoundError(f"Model weights not found at {WEIGHTS_PATH}")
+        raise FileNotFoundError(f"Weights not found at {WEIGHTS_PATH}")
     
-    # 加载权重
     print(f"Loading weights from {WEIGHTS_PATH}...")
     state_dict = torch.load(WEIGHTS_PATH, map_location=DEVICE)
     model.load_state_dict(state_dict)
     model.to(DEVICE)
     model.eval()
-    
     return SequenceInference(model)
 
 # =============================================================================
-# 比赛入口函数
+# 比赛入口
 # =============================================================================
 
 def run_algorithm(frames: np.ndarray, target: np.ndarray, frame_rate: float, magnetic_field_strength: float, scanned_region: str) -> np.ndarray:
     """
     Grand Challenge Entry Point.
-    Args:
-        frames: (W, H, T)
-        target: (W, H, 1)
-    Returns:
-        (W, H, T) uint8
+    Input: frames (W, H, T), target (W, H, 1)
+    Output: (W, H, T) uint8
     """
     global _ENGINE
     if _ENGINE is None:
         _ENGINE = _load_engine()
         
-    # 1. 维度转换: (W, H, T) -> (T, H, W)
-    # Grand Challenge 输入是 W,H,T，但 PyTorch/Scipy 通常处理 T,H,W (或 H,W)
+    # [CRITICAL FIX] 维度转换: (W, H, T) -> (T, H, W)
+    # PyTorch 需要 T 在第一维，且 W, H 需要转置以匹配 Numpy 视角
     frames_t = frames.transpose(2, 1, 0)
-    
-    # 提取第一帧掩码: (W, H, 1) -> (1, H, W) -> 取[0]得到(H, W)
     target_first = target.transpose(2, 1, 0)[0]
     
-    # 2. 执行推理
-    # 结果 shape: (T, H, W)
+    # 执行预测
     preds_t = _ENGINE.predict_sequence(frames_t, target_first)
     
-    # 3. 维度还原: (T, H, W) -> (W, H, T)
+    # 还原维度: (T, H, W) -> (W, H, T)
     final_output = preds_t.transpose(2, 1, 0)
     
     return final_output
